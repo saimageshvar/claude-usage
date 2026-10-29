@@ -23,7 +23,8 @@ case "$1" in
   off) rm -f "$state" "$stop" && echo "disarmed, stop flag cleared" ;;
   status|"")
     [ -f "$state" ] && echo "armed: $(jq -c . "$state")" || echo "not armed"
-    [ -f "$stop" ] && echo "stop flag raised: $(jq -r '"\(.reason), until \(.until | strflocaltime("%a %H:%M"))"' "$stop")" ;;
+    [ -f "$stop" ] && echo "stop flag raised: $(jq -r '"\(.reason), until \(.until | strflocaltime("%a %H:%M"))"' "$stop")"
+    exit 0 ;;
   statusline)
     input=$(cat)
     printf '%s' "$input" > "$last.$$" && mv "$last.$$" "$last"
@@ -54,6 +55,9 @@ case "$1" in
     read -r until reason < <(jq -r '"\(.until) \(.reason)"' "$stop")
     until=${until%.*}
     [ "${until:-0}" -gt "$(date +%s)" ] || { rm -f "$stop"; exit 0; }
-    printf '{"continue":false,"stopReason":"Usage limit hit: %s. Run claude-usage off to resume."}\n' "$reason" ;;
+    ev=$(jq -r '.hook_event_name // empty' 2>/dev/null)
+    # continue:false alone stops the session only after the tool ran; PreToolUse needs an explicit deny to block it
+    jq -nc --arg m "Usage limit hit: $reason. Run claude-usage off to resume." --arg e "$ev" \
+      '{continue: false, stopReason: $m} + (if $e == "PreToolUse" then {hookSpecificOutput: {hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: $m}} else {} end)' ;;
   *) echo "usage: claude-usage 5h|7d <percent> | status | off" >&2; exit 2 ;;
 esac

@@ -20,7 +20,7 @@ curl -fsSL https://raw.githubusercontent.com/saimageshvar/claude-usage/main/clau
 chmod +x ~/.local/bin/claude-usage
 ```
 
-If `~/.local/bin` is not on `PATH`, tell the user; don't edit their shell rc. Use the full path `~/.local/bin/claude-usage` for every command below.
+Check `PATH` with `case ":$PATH:" in *":$HOME/.local/bin:"*) echo on-path;; *) echo off-path;; esac`. If it is off, tell the user; don't edit their shell rc. Use the full path `~/.local/bin/claude-usage` for every command below.
 
 ## 3. Feed it the statusline JSON
 
@@ -28,7 +28,7 @@ Read `statusLine` in `~/.claude/settings.json`.
 
 If `statusLine.command` already contains `claude-usage statusline`, this step is done; skip it. Never save the wrapper as its own original command: it would call itself forever.
 
-Otherwise offer the user these options, recommending the first that applies:
+The saved original may start with `~`; that is fine, because the wrapper runs it through `bash -c`. Otherwise offer the user these options, recommending the first that applies:
 
 - **No statusLine set:** set `"statusLine": {"type": "command", "command": "~/.local/bin/claude-usage statusline"}`. Warn the user that any custom statusline hides most of Claude Code's footer hints, and this wrapper prints nothing of its own.
 - **statusLine runs the user's own command** (wrapper, recommended): their script stays untouched. Save the existing command string, unchanged, to `~/.claude/usage-orig-statusline`, then set `statusLine.command` to `~/.local/bin/claude-usage statusline`. The wrapper runs the saved command with `bash -c` and the same stdin, and prints its output unchanged.
@@ -50,16 +50,17 @@ Add one entry to each of `hooks.PreToolUse` and `hooks.UserPromptSubmit` in `~/.
 {"hooks": [{"type": "command", "command": "[ ! -f ~/.claude/usage-stop.json ] || ~/.local/bin/claude-usage hook", "timeout": 5}]}
 ```
 
-PreToolUse halts a session before its next tool or subagent starts. UserPromptSubmit stops a halted session from being restarted by a new prompt. Edit with `jq` to a temp file, check that it parses, then move it into place. Never overwrite unrelated keys.
+Use no `matcher`, so the hook applies to every tool, even if the user's other PreToolUse entries have one. The hooks are live as soon as the file is saved, which matters for step 5. PreToolUse halts a session before its next tool or subagent starts. UserPromptSubmit stops a halted session from being restarted by a new prompt. Edit with `jq` to a temp file, check that it parses, then move it into place. Never overwrite unrelated keys.
 
 ## 5. Verify without arming anything real
 
 1. Pipe a sample payload through the wrapper (or your patched script) and confirm the user's original statusline output is unchanged and `~/.claude/usage-last.json` exists:
    `echo '{"rate_limits":{"five_hour":{"used_percentage":1,"resets_at":1999999999},"seven_day":{"used_percentage":1,"resets_at":1999999999}}}' | ~/.local/bin/claude-usage statusline`
+   This overwrites `usage-last.json` with fake 1% values until the next real statusline render (seconds, in any live session). Don't arm a limit before then.
 2. `~/.local/bin/claude-usage status` prints `not armed`.
 3. Test the hook as a single command in one tool call (the hooks are already live, so a flag left behind would halt you; it self-clears after 60 s):
-   `echo '{"reason":"setup test","until":'$(( $(date +%s)+60 ))'}' > ~/.claude/usage-stop.json; echo '{}' | ~/.local/bin/claude-usage hook; ~/.local/bin/claude-usage off`
-   The hook must print JSON containing `"continue":false`, and `off` must clear the flag.
+   `echo '{"reason":"setup test","until":'$(( $(date +%s)+60 ))'}' > ~/.claude/usage-stop.json; echo '{"hook_event_name":"PreToolUse"}' | ~/.local/bin/claude-usage hook; ~/.local/bin/claude-usage off`
+   The hook must print JSON containing `"continue":false` and `"permissionDecision":"deny"`, and `off` must clear the flag.
 
 ## 6. Report
 
@@ -67,4 +68,4 @@ Tell the user what you changed (files and lines) and show usage: `~/.local/bin/c
 
 ## Uninstall
 
-Restore `statusLine.command` from `~/.claude/usage-orig-statusline` (or delete the `statusLine` key if that file is empty or absent) and remove any lines you patched into their script. Remove the `claude-usage hook` entries from `hooks.PreToolUse` and `hooks.UserPromptSubmit`, then delete `~/.local/bin/claude-usage` and `~/.claude/usage-*`.
+Restore `statusLine.command` from `~/.claude/usage-orig-statusline` (or delete the `statusLine` key if that file is empty or absent) and remove any lines you patched into their script. Remove the `claude-usage hook` entries from `hooks.PreToolUse` and `hooks.UserPromptSubmit`, then delete `~/.local/bin/claude-usage` and the files `usage-kill.json`, `usage-stop.json`, `usage-last.json` and `usage-orig-statusline` in `~/.claude`. The `settings.json.bak-claude-usage` backup is yours to keep or delete.
