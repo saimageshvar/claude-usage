@@ -1,5 +1,5 @@
 #!/bin/bash
-# Usage kill switch: claude-usage 5h 30% | 7d 10% | status | off | install | uninstall
+# Usage kill switch: claude-usage 5h 30% | 7d 10% | status | off
 # The statusline tap runs `check` each render; crossing a limit raises a stop flag and disarms.
 # A PostToolUse hook (`hook`) then halts every session at each tool call until the tripped window resets or `off`.
 dir="$HOME/.claude"
@@ -7,13 +7,6 @@ state="$dir/usage-kill.json"
 stop="$dir/usage-stop.json"
 last="$dir/usage-last.json"
 orig="$dir/usage-orig-statusline"
-settings="$dir/settings.json"
-self="$HOME/.local/bin/claude-usage"
-
-edit_settings() {
-  [ -f "$settings" ] || echo '{}' > "$settings"
-  jq "$@" "$settings" > "$settings.tmp.$$" && mv "$settings.tmp.$$" "$settings"
-}
 
 case "$1" in
   5h|7d)
@@ -58,26 +51,5 @@ case "$1" in
     read -r until reason < <(jq -r '"\(.until) \(.reason)"' "$stop")
     [ "${until:-0}" -gt "$(date +%s)" ] || { rm -f "$stop"; exit 0; }
     printf '{"continue":false,"stopReason":"Usage limit hit: %s. Run claude-usage off to resume."}\n' "$reason" ;;
-  install)
-    command -v jq >/dev/null || { echo "jq is required (brew install jq)" >&2; exit 1; }
-    mkdir -p "$dir" "$(dirname "$self")"
-    [ "$(realpath "$0")" = "$(realpath "$self" 2>/dev/null)" ] || { cp "$0" "$self.tmp" && chmod +x "$self.tmp" && mv "$self.tmp" "$self"; }
-    cmd=$(jq -r '.statusLine.command // empty' "$settings" 2>/dev/null)
-    case "$cmd" in
-      *"claude-usage statusline"*) ;;
-      *) printf '%s' "$cmd" > "$orig" ;;
-    esac
-    edit_settings --arg sl "$self statusline" --arg hk "[ ! -f ~/.claude/usage-stop.json ] || $self hook" '
-      .statusLine = {type: "command", command: $sl}
-      | .hooks.PostToolUse = ((.hooks.PostToolUse // []) | map(select(any(.hooks[]?; .command | contains("claude-usage hook") | not) or (.hooks | length) == 0))
-          + [{hooks: [{type: "command", command: $hk, timeout: 5}]}])'
-    echo "installed to $self (statusline wrapped, PostToolUse hook added). Restart running sessions to pick it up."
-    case ":$PATH:" in *":$(dirname "$self"):"*) ;; *) echo "note: add $(dirname "$self") to your PATH" ;; esac ;;
-  uninstall)
-    if [ -s "$orig" ]; then edit_settings --arg c "$(cat "$orig")" '.statusLine = {type: "command", command: $c}'
-    else edit_settings 'del(.statusLine)'; fi
-    edit_settings '.hooks.PostToolUse |= map(select(all(.hooks[]?; .command | contains("claude-usage hook") | not)))'
-    rm -f "$state" "$stop" "$last" "$orig" "$self"
-    echo "uninstalled" ;;
-  *) echo "usage: claude-usage 5h|7d <percent> | status | off | install | uninstall" >&2; exit 2 ;;
+  *) echo "usage: claude-usage 5h|7d <percent> | status | off" >&2; exit 2 ;;
 esac
