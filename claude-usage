@@ -1,0 +1,83 @@
+#!/bin/bash
+# Usage kill switch: claude-usage 5h 30% | 7d 10% | status | off | install | uninstall
+# The statusline tap runs `check` each render; crossing a limit raises a stop flag and disarms.
+# A PostToolUse hook (`hook`) then halts every session at each tool call until the tripped window resets or `off`.
+dir="$HOME/.claude"
+state="$dir/usage-kill.json"
+stop="$dir/usage-stop.json"
+last="$dir/usage-last.json"
+orig="$dir/usage-orig-statusline"
+settings="$dir/settings.json"
+self="$HOME/.local/bin/claude-usage"
+
+edit_settings() {
+  [ -f "$settings" ] || echo '{}' > "$settings"
+  jq "$@" "$settings" > "$settings.tmp.$$" && mv "$settings.tmp.$$" "$settings"
+}
+
+case "$1" in
+  5h|7d)
+    pct=${2%\%}
+    [[ "$pct" =~ ^[0-9]+$ ]] || { echo "usage: claude-usage 5h|7d <percent>" >&2; exit 2; }
+    key=five_hour; [ "$1" = 7d ] && key=seven_day
+    now=$(jq -r ".rate_limits.$key.used_percentage // 0 | ceil" "$last" 2>/dev/null || echo 0)
+    [ "$now" -ge "$pct" ] && { echo "$1 is already at ~${now}% (>= ${pct}%) — it would fire immediately" >&2; exit 1; }
+    rm -f "$stop"
+    [ -f "$state" ] || echo '{}' > "$state"
+    jq --arg w "$1" --argjson p "$pct" '.[$w]=$p' "$state" > "$state.tmp" && mv "$state.tmp" "$state"
+    echo "armed $1 >= ${pct}% (now ${now}%). $(jq -c . "$state")" ;;
+  off) rm -f "$state" "$stop" && echo "disarmed, stop flag cleared" ;;
+  status|"")
+    [ -f "$state" ] && echo "armed: $(jq -c . "$state")" || echo "not armed"
+    [ -f "$stop" ] && echo "stop flag raised: $(jq -r '"\(.reason), until \(.until | strflocaltime("%a %H:%M"))"' "$stop")" ;;
+  statusline)
+    input=$(cat)
+    printf '%s' "$input" > "$last.$$" && mv "$last.$$" "$last"
+    if [ -f "$state" ]; then
+      read -r a b ra rb < <(jq -r '.rate_limits | [(.five_hour.used_percentage // 0 | round), (.seven_day.used_percentage // 0 | round), (.five_hour.resets_at // 0), (.seven_day.resets_at // 0)] | join(" ")' <<<"$input")
+      "$0" check "${a:-0}" "${b:-0}" "${ra:-0}" "${rb:-0}" >/dev/null 2>&1 &
+    fi
+    [ -s "$orig" ] && printf '%s' "$input" | sh -c "$(cat "$orig")" ;;
+  check)
+    [ -f "$state" ] || exit 0
+    out=$(jq -c --argjson a "${2:-0}" --argjson b "${3:-0}" --argjson ra "${4:-0}" --argjson rb "${5:-0}" '
+      def until: if . > 0 then . else (now | floor) + 18000 end;
+      [ if .["5h"] and $a >= .["5h"] then ["5h at \($a)% (limit \(.["5h"])%)", ($ra | until)] else empty end,
+        if .["7d"] and $b >= .["7d"] then ["7d at \($b)% (limit \(.["7d"])%)", ($rb | until)] else empty end ] as $h
+      | if ($h | length) > 0 then {reason: ($h | map(.[0]) | join(", ")), until: ($h | map(.[1]) | max)} else empty end' "$state")
+    [ -n "$out" ] || exit 0
+    # flag first (atomic, idempotent for racers), then the mv claim picks one process to notify
+    echo "$out" > "$stop.$$" && mv "$stop.$$" "$stop"
+    mv "$state" "$state.fired.$$" 2>/dev/null || exit 0
+    rm -f "$state.fired.$$"
+    command -v terminal-notifier >/dev/null &&
+      terminal-notifier -title claude-usage -message "$(jq -r .reason "$stop") — stopping all sessions" -group claude-usage >/dev/null 2>&1
+    exit 0 ;;
+  hook)
+    [ -f "$stop" ] || exit 0
+    read -r until reason < <(jq -r '"\(.until) \(.reason)"' "$stop")
+    [ "${until:-0}" -gt "$(date +%s)" ] || { rm -f "$stop"; exit 0; }
+    printf '{"continue":false,"stopReason":"Usage limit hit: %s. Run claude-usage off to resume."}\n' "$reason" ;;
+  install)
+    command -v jq >/dev/null || { echo "jq is required (brew install jq)" >&2; exit 1; }
+    mkdir -p "$dir" "$(dirname "$self")"
+    [ "$(realpath "$0")" = "$(realpath "$self" 2>/dev/null)" ] || { cp "$0" "$self.tmp" && chmod +x "$self.tmp" && mv "$self.tmp" "$self"; }
+    cmd=$(jq -r '.statusLine.command // empty' "$settings" 2>/dev/null)
+    case "$cmd" in
+      *"claude-usage statusline"*) ;;
+      *) printf '%s' "$cmd" > "$orig" ;;
+    esac
+    edit_settings --arg sl "$self statusline" --arg hk "[ ! -f ~/.claude/usage-stop.json ] || $self hook" '
+      .statusLine = {type: "command", command: $sl}
+      | .hooks.PostToolUse = ((.hooks.PostToolUse // []) | map(select(any(.hooks[]?; .command | contains("claude-usage hook") | not) or (.hooks | length) == 0))
+          + [{hooks: [{type: "command", command: $hk, timeout: 5}]}])'
+    echo "installed to $self (statusline wrapped, PostToolUse hook added). Restart running sessions to pick it up."
+    case ":$PATH:" in *":$(dirname "$self"):"*) ;; *) echo "note: add $(dirname "$self") to your PATH" ;; esac ;;
+  uninstall)
+    if [ -s "$orig" ]; then edit_settings --arg c "$(cat "$orig")" '.statusLine = {type: "command", command: $c}'
+    else edit_settings 'del(.statusLine)'; fi
+    edit_settings '.hooks.PostToolUse |= map(select(all(.hooks[]?; .command | contains("claude-usage hook") | not)))'
+    rm -f "$state" "$stop" "$last" "$orig" "$self"
+    echo "uninstalled" ;;
+  *) echo "usage: claude-usage 5h|7d <percent> | status | off | install | uninstall" >&2; exit 2 ;;
+esac
