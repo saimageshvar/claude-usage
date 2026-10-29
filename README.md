@@ -18,7 +18,7 @@ Setup touches your `statusLine` and hooks in `~/.claude/settings.json`, so an ag
 claude "Set up claude-usage by following https://raw.githubusercontent.com/saimageshvar/claude-usage/main/SETUP.md"
 ```
 
-The agent backs up `settings.json`, installs the script to `~/.local/bin`, wraps your statusline (or patches it, if you prefer), adds the `PostToolUse` hook, and verifies without arming anything. Restart running sessions afterwards. Uninstall steps are at the end of `SETUP.md`.
+The agent backs up `settings.json`, installs the script to `~/.local/bin`, wraps your statusline (or patches it, if you prefer), adds the `PreToolUse` and `UserPromptSubmit` hooks, and verifies without arming anything. If a running session doesn't halt in a later test, restart it. Uninstall steps are at the end of `SETUP.md`.
 
 ## Use
 
@@ -29,10 +29,12 @@ claude-usage status
 claude-usage off        # disarm and lift a block
 ```
 
-Arming is one-shot. When a limit trips, the switch disarms and every tool call in every session (subagents included) is halted until the tripped window resets or you run `claude-usage off`. Sessions resume with `claude --resume`.
+Arming is one-shot. When a limit trips, the switch disarms and every session is halted before its next tool call and refuses new prompts until the tripped window resets or you run `claude-usage off`. Sessions resume with `claude --resume`.
 
 ## How it works
 
-Claude Code hands the statusline `rate_limits` on every render, but hooks never see usage. The statusline wrapper forks a background `check` only while armed (about 5 ms, off the render path). A trip writes `~/.claude/usage-stop.json`, and the `PostToolUse` hook returns `continue:false` while it is live (about 2 ms per tool call when idle).
+Claude Code hands the statusline `rate_limits` on every render, but hooks never see usage. The statusline wrapper forks a background `check` only while armed (about 5 ms, off the render path). A trip writes `~/.claude/usage-stop.json`, and the hooks return `continue:false` while it is live (about 2 ms per tool call when idle).
+
+`rate_limits` only appears for claude.ai Pro/Max subscriptions (or a gateway with spend limits); on a plain API key the switch can never trip.
 
 Headless `claude -p` sessions never render a statusline, so an interactive session must be open for a crossing to be detected; the hook then stops headless ones too.

@@ -1,7 +1,7 @@
 #!/bin/bash
 # Usage kill switch: claude-usage 5h 30% | 7d 10% | status | off
 # The statusline tap runs `check` each render; crossing a limit raises a stop flag and disarms.
-# A PostToolUse hook (`hook`) then halts every session at each tool call until the tripped window resets or `off`.
+# PreToolUse and UserPromptSubmit hooks (`hook`) then halt every session until the tripped window resets or `off`.
 dir="$HOME/.claude"
 state="$dir/usage-kill.json"
 stop="$dir/usage-stop.json"
@@ -13,7 +13,8 @@ case "$1" in
     pct=${2%\%}
     [[ "$pct" =~ ^[0-9]+$ ]] || { echo "usage: claude-usage 5h|7d <percent>" >&2; exit 2; }
     key=five_hour; [ "$1" = 7d ] && key=seven_day
-    now=$(jq -r ".rate_limits.$key.used_percentage // 0 | ceil" "$last" 2>/dev/null || echo 0)
+    now=$(jq -r ".rate_limits.$key.used_percentage // 0 | round" "$last" 2>/dev/null)
+    now=${now:-0}
     [ "$now" -ge "$pct" ] && { echo "$1 is already at ~${now}% (>= ${pct}%) — it would fire immediately" >&2; exit 1; }
     rm -f "$stop"
     [ -f "$state" ] || echo '{}' > "$state"
@@ -30,11 +31,13 @@ case "$1" in
       read -r a b ra rb < <(jq -r '.rate_limits | [(.five_hour.used_percentage // 0 | round), (.seven_day.used_percentage // 0 | round), (.five_hour.resets_at // 0), (.seven_day.resets_at // 0)] | join(" ")' <<<"$input")
       "$0" check "${a:-0}" "${b:-0}" "${ra:-0}" "${rb:-0}" >/dev/null 2>&1 &
     fi
-    [ -s "$orig" ] && printf '%s' "$input" | sh -c "$(cat "$orig")" ;;
+    wrapped=$(cat "$orig" 2>/dev/null)
+    # a saved command that is this wrapper would recurse forever
+    case "$wrapped" in ""|*"claude-usage statusline"*) ;; *) printf '%s' "$input" | bash -c "$wrapped" ;; esac ;;
   check)
     [ -f "$state" ] || exit 0
     out=$(jq -c --argjson a "${2:-0}" --argjson b "${3:-0}" --argjson ra "${4:-0}" --argjson rb "${5:-0}" '
-      def until: if . > 0 then . else (now | floor) + 18000 end;
+      def until: (if . > 0 then . else now + 18000 end) | floor;
       [ if .["5h"] and $a >= .["5h"] then ["5h at \($a)% (limit \(.["5h"])%)", ($ra | until)] else empty end,
         if .["7d"] and $b >= .["7d"] then ["7d at \($b)% (limit \(.["7d"])%)", ($rb | until)] else empty end ] as $h
       | if ($h | length) > 0 then {reason: ($h | map(.[0]) | join(", ")), until: ($h | map(.[1]) | max)} else empty end' "$state")
@@ -49,6 +52,7 @@ case "$1" in
   hook)
     [ -f "$stop" ] || exit 0
     read -r until reason < <(jq -r '"\(.until) \(.reason)"' "$stop")
+    until=${until%.*}
     [ "${until:-0}" -gt "$(date +%s)" ] || { rm -f "$stop"; exit 0; }
     printf '{"continue":false,"stopReason":"Usage limit hit: %s. Run claude-usage off to resume."}\n' "$reason" ;;
   *) echo "usage: claude-usage 5h|7d <percent> | status | off" >&2; exit 2 ;;
