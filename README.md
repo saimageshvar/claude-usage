@@ -25,6 +25,7 @@ The agent backs up `settings.json`, installs the script to `~/.local/bin`, wraps
 ```sh
 claude-usage 5h 30%     # arm: stop everything when 5h usage >= 30%
 claude-usage 7d 10%     # arm the weekly window too; whichever trips first fires
+claude-usage 5h 30% 7d 40%   # or arm both in one command (all pairs are validated first; nothing is armed if one is bad)
 claude-usage status
 claude-usage off        # disarm and lift a block
 ```

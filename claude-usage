@@ -1,5 +1,5 @@
 #!/bin/bash
-# Usage kill switch: claude-usage 5h 30% | 7d 10% | status | off
+# Usage kill switch: claude-usage 5h 30% [7d 10%] | status | off
 # The statusline tap runs `check` each render; crossing a limit raises a stop flag and disarms.
 # PreToolUse and UserPromptSubmit hooks (`hook`) then halt every session until the tripped window resets or `off`.
 dir="$HOME/.claude"
@@ -10,26 +10,34 @@ orig="$dir/usage-orig-statusline"
 
 case "$1" in
   5h|7d)
-    pct=${2%\%}
-    [[ "$pct" =~ ^[0-9]+$ ]] || { echo "usage: claude-usage 5h|7d <percent>" >&2; exit 2; }
-    key=five_hour; [ "$1" = 7d ] && key=seven_day
-    now=$(jq -r ".rate_limits.$key.used_percentage // 0 | round" "$last" 2>/dev/null)
-    now=${now:-0}
-    [ "$now" -ge "$pct" ] && { echo "$1 is already at ~${now}% (>= ${pct}%) — it would fire immediately" >&2; exit 1; }
+    # validate every pair before arming anything, so a typo in the second pair never half-arms
+    new='{}'; msg=""
+    while [ $# -gt 0 ]; do
+      w=$1; pct=${2%\%}
+      case "$w" in 5h|7d) ;; *) echo "unknown window '$w' (use 5h or 7d)" >&2; exit 2 ;; esac
+      [[ "$pct" =~ ^[0-9]+$ ]] && [ "$pct" -ge 1 ] && [ "$pct" -le 100 ] || { echo "bad percent '${2-}' for $w (whole number, 1-100)" >&2; exit 2; }
+      key=five_hour; [ "$w" = 7d ] && key=seven_day
+      now=$(jq -r ".rate_limits.$key.used_percentage // 0 | round" "$last" 2>/dev/null)
+      now=${now:-0}
+      [ "$now" -ge "$pct" ] && { echo "$w is already at ~${now}% (>= ${pct}%) — it would fire immediately" >&2; exit 1; }
+      new=$(jq -c --arg w "$w" --argjson p "$pct" '.[$w]=$p' <<<"$new")
+      msg+="$w >= ${pct}% (now ${now}%); "
+      shift 2
+    done
     rm -f "$stop"
-    [ -f "$state" ] || echo '{}' > "$state"
-    jq --arg w "$1" --argjson p "$pct" '.[$w]=$p' "$state" > "$state.tmp" && mv "$state.tmp" "$state"
-    echo "armed $1 >= ${pct}% (now ${now}%). $(jq -c . "$state")" ;;
+    base=$(jq -c . "$state" 2>/dev/null || echo '{}')
+    jq -cn --argjson a "$base" --argjson b "$new" '$a + $b' > "$state.tmp.$$" && mv "$state.tmp.$$" "$state"
+    echo "armed ${msg%; }. $(jq -c . "$state")" ;;
   off) rm -f "$state" "$stop" && echo "disarmed, stop flag cleared" ;;
   status|"")
-    [ -f "$state" ] && echo "armed: $(jq -c . "$state")" || echo "not armed"
+    if [ -f "$state" ]; then echo "armed: $(jq -c . "$state" 2>/dev/null || echo "state file is unreadable, run: claude-usage off")"; else echo "not armed"; fi
     [ -f "$stop" ] && echo "stop flag raised: $(jq -r '"\(.reason), until \(.until | strflocaltime("%a %H:%M"))"' "$stop")"
     exit 0 ;;
   statusline)
     input=$(cat)
     printf '%s' "$input" > "$last.$$" && mv "$last.$$" "$last"
     if [ -f "$state" ]; then
-      read -r a b ra rb < <(jq -r '.rate_limits | [(.five_hour.used_percentage // 0 | round), (.seven_day.used_percentage // 0 | round), (.five_hour.resets_at // 0), (.seven_day.resets_at // 0)] | join(" ")' <<<"$input")
+      read -r a b ra rb < <(jq -r '.rate_limits | [(.five_hour.used_percentage // 0 | round), (.seven_day.used_percentage // 0 | round), (.five_hour.resets_at // 0), (.seven_day.resets_at // 0)] | join(" ")' <<<"$input" 2>/dev/null)
       "$0" check "${a:-0}" "${b:-0}" "${ra:-0}" "${rb:-0}" >/dev/null 2>&1 &
     fi
     wrapped=$(cat "$orig" 2>/dev/null)
@@ -52,12 +60,14 @@ case "$1" in
     exit 0 ;;
   hook)
     [ -f "$stop" ] || exit 0
-    read -r until reason < <(jq -r '"\(.until) \(.reason)"' "$stop")
+    read -r until reason < <(jq -r '"\(.until) \(.reason)"' "$stop" 2>/dev/null)
     until=${until%.*}
-    [ "${until:-0}" -gt "$(date +%s)" ] || { rm -f "$stop"; exit 0; }
+    # only a readable, expired flag lifts the block; an unreadable one keeps halting until `off`
+    [[ "$until" =~ ^[0-9]+$ ]] && [ "$until" -le "$(date +%s)" ] && { rm -f "$stop"; exit 0; }
+    reason=${reason:-unreadable stop flag}
     ev=$(jq -r '.hook_event_name // empty' 2>/dev/null)
     # continue:false alone stops the session only after the tool ran; PreToolUse needs an explicit deny to block it
     jq -nc --arg m "Usage limit hit: $reason. Run claude-usage off to resume." --arg e "$ev" \
       '{continue: false, stopReason: $m} + (if $e == "PreToolUse" then {hookSpecificOutput: {hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: $m}} else {} end)' ;;
-  *) echo "usage: claude-usage 5h|7d <percent> | status | off" >&2; exit 2 ;;
+  *) echo "usage: claude-usage 5h|7d <percent> [5h|7d <percent>] | status | off" >&2; exit 2 ;;
 esac
