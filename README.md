@@ -28,13 +28,13 @@ claude-usage 7d 10%     # arm the weekly window too; whichever trips first fires
 claude-usage 5h 30% 7d 40%   # or arm both in one command (all pairs are validated first; nothing is armed if one is bad)
 claude-usage status
 claude-usage off        # disarm and lift a block
-claude-usage --warn 50,80 5h 30%   # change the warning steps (default 70,90; `--warn none` turns them off)
+claude-usage --warn 50,80 5h 30%   # change the warning steps (default 95; `--warn none` turns them off)
 claude-usage --session <id> 5h 30% # arm for one session only, for testing; never touches the global arm
 ```
 
 ## Warnings before the limit
 
-Each armed limit also warns at 70% and 90% of the way to it (a 30% limit warns at 21% and 27%), once per step per window. The warning goes to the agents themselves: each session gets a note as extra context on its next tool call or prompt, telling it to finish or checkpoint, commit work in progress and not start long tasks, so overnight work lands cleanly before the hard stop. If you jump past several steps at once, only the highest is announced.
+Each armed limit also warns once, at 95% of the way to it (a 30% limit warns at 29%), once per window; the warning point is always at least one point below the limit. `--warn 50,80` sets other steps. The warning goes to the agents themselves: each session gets a note as extra context on its next tool call or prompt, telling it to finish or checkpoint, commit work in progress and not start long tasks, so overnight work lands cleanly before the hard stop. If you jump past several steps at once, only the highest is announced.
 
 To also reach yourself, put a shell command in `~/.claude/usage-notify`; it receives the message as `$1`, for example `slack-ping "$1"`. There is no desktop banner for warnings by default.
 

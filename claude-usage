@@ -1,5 +1,5 @@
 #!/bin/bash
-# Usage kill switch: claude-usage [--session <id>] [--warn 70,90|none] 5h 30% [7d 10%] | status | off
+# Usage kill switch: claude-usage [--session <id>] [--warn 95|none] 5h 30% [7d 10%] | status | off
 # The statusline tap runs `check` each render; crossing a limit raises a stop flag and disarms.
 # PreToolUse and UserPromptSubmit hooks (`hook`) then halt every session until the tripped window resets or `off`.
 # Before the limit, `check` also raises a one-off warning per step; the same hooks hand it to each session once.
@@ -29,10 +29,10 @@ warn_check() {
     esac
   done < <(jq -r --argjson a "$1" --argjson b "$2" --argjson ra "$3" --argjson rb "$4" --arg sid "$5" '
     select((.session // "") == "" or .session == $sid)
-    | . as $st | ($st.warn // [70,90]) as $steps
+    | . as $st | ($st.warn // [95]) as $steps
     | [{k:"5h",c:$a,r:$ra},{k:"7d",c:$b,r:$rb}][]
     | select($st[.k] != null) | . as $w | $steps[] as $s
-    | ((($st[$w.k] * $s) / 100) | ceil) as $t
+    | ([ ((($st[$w.k] * $s) / 100) | ceil), ($st[$w.k] - 1) ] | min | [., 1] | max) as $t
     | select($w.c >= $t)
     | "\($w.k) \($w.r) \($s) \($w.c) \($st[$w.k])"' "$state" 2>/dev/null)
   msg="${m5}${m5:+${m7:+; }}${m7}"
@@ -66,17 +66,17 @@ hook_warn() {
 case "$1" in
   5h|7d|--session|--warn)
     # --session <id> scopes the switch to one session (for testing): its own statusline trips it, only it halts
-    # --warn 50,80 sets the warning steps, as percents of the limit (default 70,90); none turns warnings off
+    # --warn 50,80 sets the warning steps, as percents of the limit (default 95); none turns warnings off
     sess=""; warn=""
     while [ "${1-}" = --session ] || [ "${1-}" = --warn ]; do
-      [ $# -ge 2 ] || { echo "usage: claude-usage [--session <id>] [--warn 70,90|none] 5h|7d <percent> [...]" >&2; exit 2; }
+      [ $# -ge 2 ] || { echo "usage: claude-usage [--session <id>] [--warn 95|none] 5h|7d <percent> [...]" >&2; exit 2; }
       case "$1" in
         --session) sess=$2; [[ "$sess" =~ ^[A-Za-z0-9-]+$ ]] || { echo "bad session id '$2'" >&2; exit 2; } ;;
         --warn) warn=$2; [ "$warn" = none ] || [[ "$warn" =~ ^[1-9][0-9]?(,[1-9][0-9]?)*$ ]] || { echo "bad --warn '$2' (whole percents of the limit, 1-99, e.g. 50,80; or none)" >&2; exit 2; } ;;
       esac
       shift 2
     done
-    [ $# -ge 2 ] || { echo "usage: claude-usage [--session <id>] [--warn 70,90|none] 5h|7d <percent> [...]" >&2; exit 2; }
+    [ $# -ge 2 ] || { echo "usage: claude-usage [--session <id>] [--warn 95|none] 5h|7d <percent> [...]" >&2; exit 2; }
     # validate every pair before arming anything, so a typo in the second pair never half-arms
     new='{}'; msg=""
     while [ $# -gt 0 ]; do
@@ -164,5 +164,5 @@ case "$1" in
     # continue:false alone stops the session only after the tool ran; PreToolUse needs an explicit deny to block it
     jq -nc --arg m "Usage limit hit: $reason. Run claude-usage off to resume." --arg e "$ev" \
       '{continue: false, stopReason: $m} + (if $e == "PreToolUse" then {hookSpecificOutput: {hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: $m}} else {} end)' ;;
-  *) echo "usage: claude-usage [--session <id>] [--warn 70,90|none] 5h|7d <percent> [5h|7d <percent>] | status | off" >&2; exit 2 ;;
+  *) echo "usage: claude-usage [--session <id>] [--warn 95|none] 5h|7d <percent> [5h|7d <percent>] | status | off" >&2; exit 2 ;;
 esac
