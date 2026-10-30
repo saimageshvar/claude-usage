@@ -32,13 +32,13 @@ claude-usage --warn 50,80 5h 30%   # change the warning steps (default 95; `--wa
 claude-usage --session <id> 5h 30% # arm for one session only, for testing; never touches the global arm
 ```
 
+Arming is one-shot. When a limit trips, the switch disarms and every session is halted before its next tool call and refuses new prompts until the tripped window resets or you run `claude-usage off`. Sessions resume with `claude --resume`.
+
 ## Warnings before the limit
 
 Each armed limit also warns once, at 95% of the way to it (a 30% limit warns at 29%), once per window; the warning point is always at least one point below the limit. `--warn 50,80` sets other steps. The warning goes to the agents themselves: each session gets a note as extra context on its next tool call or prompt, telling it to finish or checkpoint, commit work in progress and not start long tasks, so overnight work lands cleanly before the hard stop. If you jump past several steps at once, only the highest is announced.
 
 To also reach yourself, put a shell command in `~/.claude/usage-notify`; it receives the message as `$1`, for example `slack-ping "$1"`. There is no desktop banner for warnings by default.
-
-Arming is one-shot. When a limit trips, the switch disarms and every session is halted before its next tool call and refuses new prompts until the tripped window resets or you run `claude-usage off`. Sessions resume with `claude --resume`.
 
 ## How it works
 
