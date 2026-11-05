@@ -22,9 +22,11 @@ usage: claude-usage [--session <id>] [--warn 95|50,80|none] <limit>... | status 
 Limits (any mix; whichever is hit first stops every session):
   5h 30%                  5-hour usage reaches 30%
   7d 40%                  weekly usage reaches 40%
-  at 07:00                the next 07:00 (24-hour HH:MM; today if still ahead, else tomorrow)
-  at 25-12-2026 07:00     a date and time, DD-MM-YYYY HH:MM
-  at 2026-12-25 07:00     a date and time, YYYY-MM-DD HH:MM
+  at 07:00                the next 07:00 (today if still ahead, else tomorrow)
+  at 7pm                  12-hour works too: 7pm, 7:30pm, 7:30 pm, 12am (midnight), 12pm (noon)
+  at 25-12-2026 07:00     a date and time, DD-MM-YYYY then the time (24- or 12-hour)
+  at 2026-12-25 7:30pm    a date and time, YYYY-MM-DD then the time
+  A time without am/pm is 24-hour: 7:00 is 07:00 in the morning, never 19:00.
 
 Examples:
   claude-usage 5h 30%
@@ -49,6 +51,23 @@ to_epoch() {
 }
 fmt_epoch() { date -j -r "$1" +"$2" 2>/dev/null || date -d "@$1" +"$2"; }
 tomorrow() { date -v+1d +%Y-%m-%d 2>/dev/null || date -d tomorrow +%Y-%m-%d; }
+
+# A clock time as 24-hour HH:MM (19:30) or 12-hour with am/pm attached or as the next word (7pm, 7:30pm, 7:30 pm).
+# Sets T to HH:MM and N to the words used; fails if $1 is not a time.
+parse_clock() {
+  local h m ap
+  if [[ "$1" =~ ^(1[0-2]|0?[1-9])(:([0-5][0-9]))?([aApP][mM])$ ]]; then
+    h=${BASH_REMATCH[1]}; m=${BASH_REMATCH[3]:-00}; ap=${BASH_REMATCH[4]}; N=1
+  elif [[ "$2" =~ ^[aApP][mM]$ ]] && [[ "$1" =~ ^(1[0-2]|0?[1-9])(:([0-5][0-9]))?$ ]]; then
+    h=${BASH_REMATCH[1]}; m=${BASH_REMATCH[3]:-00}; ap=$2; N=2
+  elif [[ "$1" =~ ^([01]?[0-9]|2[0-3]):([0-5][0-9])$ ]]; then
+    T=$(printf '%02d:%s' "$((10#${BASH_REMATCH[1]}))" "${BASH_REMATCH[2]}"); N=1; return 0
+  else
+    return 1
+  fi
+  h=$((10#$h % 12)); case "$ap" in [pP]*) h=$((h + 12)) ;; esac
+  T=$(printf '%02d:%s' "$h" "$m")
+}
 
 # Prints a stop flag (JSON) if the arm in $state is hit: usage from the statusline (-1 = unknown), time from the clock.
 trip_eval() {
@@ -175,21 +194,18 @@ case "$1" in
       case "$1" in
         at)
           [ -z "$at" ] || die "only one time limit per arm"
-          hhmm='^([01]?[0-9]|2[0-3]):([0-5][0-9])$'
-          if [[ "${2-}" =~ $hhmm ]]; then
-            t=$(printf '%02d:%s' "$((10#${BASH_REMATCH[1]}))" "${BASH_REMATCH[2]}")
-            at=$(to_epoch "$(date +%Y-%m-%d) $t")
-            [ -n "$at" ] && [ "$at" -le "$nowts" ] && at=$(to_epoch "$(tomorrow) $t")
-            shift 2
-          elif [[ "${3-}" =~ $hhmm ]] && { [[ "${2-}" =~ ^[0-9]{2}-[0-9]{2}-[0-9]{4}$ ]] || [[ "${2-}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; }; then
-            t=$(printf '%02d:%s' "$((10#${3%%:*}))" "${3#*:}")
+          if parse_clock "${2-}" "${3-}"; then
+            at=$(to_epoch "$(date +%Y-%m-%d) $T")
+            [ -n "$at" ] && [ "$at" -le "$nowts" ] && at=$(to_epoch "$(tomorrow) $T")
+            shift $((1 + N))
+          elif { [[ "${2-}" =~ ^[0-9]{2}-[0-9]{2}-[0-9]{4}$ ]] || [[ "${2-}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; } && parse_clock "${3-}" "${4-}"; then
             d=$2; [[ "$d" =~ ^([0-9]{2})-([0-9]{2})-([0-9]{4})$ ]] && d="${BASH_REMATCH[3]}-${BASH_REMATCH[2]}-${BASH_REMATCH[1]}"
-            at=$(to_epoch "$d $t")
-            [ -n "$at" ] || die "'$2 $3' is not a real date and time"
-            [ "$at" -gt "$nowts" ] || die "'$2 $3' is in the past"
-            shift 3
+            at=$(to_epoch "$d $T")
+            [ -n "$at" ] || die "'$2 $T' is not a real date and time"
+            [ "$at" -gt "$nowts" ] || die "'$2 $T' is in the past"
+            shift $((2 + N))
           else
-            die "bad time '${2-} ${3-}'; use HH:MM, DD-MM-YYYY HH:MM or YYYY-MM-DD HH:MM (24-hour)"
+            die "bad time '${2-} ${3-}'; use a time (07:00, 19:30, 7pm, 7:30 pm), optionally after DD-MM-YYYY or YYYY-MM-DD"
           fi
           [ -n "$at" ] || die "could not read the time '${2-}'"
           new=$(jq -c --argjson t "$at" --argjson n "$nowts" '.at=$t | .armed=$n' <<<"$new")

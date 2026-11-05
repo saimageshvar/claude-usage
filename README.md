@@ -26,8 +26,9 @@ The agent backs up `settings.json`, installs the script to `~/.local/bin`, wraps
 claude-usage 5h 30%                  # stop when 5-hour usage reaches 30%
 claude-usage 7d 40%                  # stop when weekly usage reaches 40%
 claude-usage at 07:00                # stop at the next 07:00 (today if still ahead, else tomorrow)
+claude-usage at 7pm                  # 12-hour works too: 7pm, 7:30pm, 7:30 pm, 12am, 12pm
 claude-usage at 25-12-2026 07:00     # stop at a date and time (DD-MM-YYYY HH:MM)
-claude-usage at 2026-12-25 07:00     # same, YYYY-MM-DD HH:MM
+claude-usage at 2026-12-25 7:30pm     # same, YYYY-MM-DD; either clock style after the date
 claude-usage 5h 30% 7d 40% at 07:00  # any mix: whichever is hit first stops every session
 claude-usage status
 claude-usage off                     # disarm everything and lift a block
@@ -36,7 +37,7 @@ claude-usage --warn 50,80 5h 30%     # change the warning steps (default 95; `--
 claude-usage --session <id> at 07:00 # arm for one session only, for testing; never touches the global arm
 ```
 
-Times are 24-hour local time, in exactly those three formats; anything else is rejected, as is a date and time already past. Every limit is validated before anything is armed.
+Times are local: 24-hour (`19:30`) or 12-hour with am/pm (`7:30pm`, `7:30 pm`). A time without am/pm is 24-hour, so `7:00` is 7 in the morning. A time can follow a date in DD-MM-YYYY or YYYY-MM-DD; anything else is rejected, as is a date and time already past. Every limit is validated before anything is armed.
 
 Arming is one-shot. When a limit trips, the switch disarms and every session is halted before its next tool call and refuses new prompts. A usage stop lifts when its window resets; a time stop holds until you run `claude-usage off`. Sessions resume with `claude --resume`.
 
