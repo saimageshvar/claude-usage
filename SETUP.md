@@ -47,10 +47,10 @@ The saved original may start with `~`; that is fine, because the wrapper runs it
 Add one entry to each of `hooks.PreToolUse` and `hooks.UserPromptSubmit` in `~/.claude/settings.json` (create the keys if missing; keep every existing entry; skip an event if an entry containing `claude-usage hook` is already there):
 
 ```json
-{"hooks": [{"type": "command", "command": "{ [ ! -f ~/.claude/usage-stop.json ] && [ ! -f ~/.claude/usage-warn.json ] && [ ! -d ~/.claude/usage-kill.d ]; } || ~/.local/bin/claude-usage hook", "timeout": 5}]}
+{"hooks": [{"type": "command", "command": "{ [ ! -f ~/.claude/usage-stop.json ] && [ ! -f ~/.claude/usage-warn.json ] && [ ! -d ~/.claude/usage-kill.d ] && [ ! -f ~/.claude/usage-deadline ]; } || ~/.local/bin/claude-usage hook", "timeout": 5}]}
 ```
 
-The guard keeps an idle session to one cheap file test per call: the script only runs while a stop flag, a pending warning or a one-session test arm exists. If a `claude-usage hook` entry from an older install is already there, replace its command with this one. Use no `matcher`, so the hook applies to every tool, even if the user's other PreToolUse entries have one. The hooks are live as soon as the file is saved, which matters for step 5. PreToolUse halts a session before its next tool or subagent starts. UserPromptSubmit stops a halted session from being restarted by a new prompt. Edit with `jq` to a temp file, check that it parses, then move it into place. Never overwrite unrelated keys.
+The guard keeps an idle session to one cheap file test per call: the script only runs while a stop flag, a pending warning, a one-session test arm or a time limit exists. If a `claude-usage hook` entry from an older install is already there, replace its command with this one. Use no `matcher`, so the hook applies to every tool, even if the user's other PreToolUse entries have one. The hooks are live as soon as the file is saved, which matters for step 5. PreToolUse halts a session before its next tool or subagent starts. UserPromptSubmit stops a halted session from being restarted by a new prompt. Edit with `jq` to a temp file, check that it parses, then move it into place. Never overwrite unrelated keys.
 
 ## 5. Verify without arming anything real
 
@@ -68,4 +68,4 @@ Tell the user what you changed (files and lines) and show usage: `~/.local/bin/c
 
 ## Uninstall
 
-Restore `statusLine.command` from `~/.claude/usage-orig-statusline` (or delete the `statusLine` key if that file is empty or absent) and remove any lines you patched into their script. Remove the `claude-usage hook` entries from `hooks.PreToolUse` and `hooks.UserPromptSubmit`, then delete `~/.local/bin/claude-usage` and the files `usage-kill.json`, `usage-stop.json`, `usage-warn.json`, `usage-last.json`, `usage-orig-statusline` and `usage-notify`, and the folders `usage-kill.d` and `usage-warned`, in `~/.claude`. The `settings.json.bak-claude-usage` backup is yours to keep or delete.
+Restore `statusLine.command` from `~/.claude/usage-orig-statusline` (or delete the `statusLine` key if that file is empty or absent) and remove any lines you patched into their script. Remove the `claude-usage hook` entries from `hooks.PreToolUse` and `hooks.UserPromptSubmit`, then delete `~/.local/bin/claude-usage` and the files `usage-kill.json`, `usage-stop.json`, `usage-warn.json`, `usage-last.json`, `usage-orig-statusline`, `usage-notify` and `usage-deadline`, and the folders `usage-kill.d` and `usage-warned`, in `~/.claude`. The `settings.json.bak-claude-usage` backup is yours to keep or delete.

@@ -1,8 +1,8 @@
 #!/bin/bash
-# Usage kill switch: claude-usage [--session <id>] [--warn 95|none] 5h 30% [7d 10%] | status | off
-# The statusline tap runs `check` each render; crossing a limit raises a stop flag and disarms.
-# PreToolUse and UserPromptSubmit hooks (`hook`) then halt every session until the tripped window resets or `off`.
-# Before the limit, `check` also raises a one-off warning per step; the same hooks hand it to each session once.
+# Usage kill switch: stop Claude Code sessions at a 5h/7d usage limit or a clock time, whichever comes first.
+# The statusline tap runs `check` each render; the PreToolUse/UserPromptSubmit `hook` also checks the clock.
+# A trip raises a stop flag and disarms; the hooks then halt sessions until the window resets (usage) or `off` (time).
+# Before a limit, a one-off warning per step is handed to each session once by the same hooks.
 dir="$HOME/.claude"
 state="$dir/usage-kill.json"
 gstate="$state"
@@ -12,16 +12,86 @@ last="$dir/usage-last.json"
 orig="$dir/usage-orig-statusline"
 warnf="$dir/usage-warn.json"
 wdir="$dir/usage-warned"
+dl="$dir/usage-deadline"   # exists while the global arm has a time limit, so the hook guard knows to run
+held=4102444800            # stop-flag `until` for a time trip: it holds until `claude-usage off`
+
+usage() {
+  cat <<'EOF'
+usage: claude-usage [--session <id>] [--warn 95|50,80|none] <limit>... | status | off | help
+
+Limits (any mix; whichever is hit first stops every session):
+  5h 30%                  5-hour usage reaches 30%
+  7d 40%                  weekly usage reaches 40%
+  at 07:00                the next 07:00 (24-hour HH:MM; today if still ahead, else tomorrow)
+  at 25-12-2026 07:00     a date and time, DD-MM-YYYY HH:MM
+  at 2026-12-25 07:00     a date and time, YYYY-MM-DD HH:MM
+
+Examples:
+  claude-usage 5h 30%
+  claude-usage at 07:00
+  claude-usage 5h 30% 7d 40% at 07:00
+
+Options:
+  --warn 95       warn sessions at 95% of the way to each limit (default); 50,80 for several steps; none for off
+  --session <id>  arm for one session only (testing); never touches the global arm
+
+A usage stop lifts when its window resets; a time stop holds until `claude-usage off`.
+EOF
+}
+
+die() { echo "claude-usage: $*" >&2; exit 2; }
+
+# Local "YYYY-MM-DD HH:MM" to epoch, empty if it is not a real date (BSD date, then GNU date).
+to_epoch() {
+  local e
+  e=$(date -j -f '%Y-%m-%d %H:%M:%S' "$1:00" +%s 2>/dev/null || date -d "$1:00" +%s 2>/dev/null) || return 0
+  [ "$(fmt_epoch "$e" '%Y-%m-%d %H:%M')" = "$1" ] && echo "$e"
+}
+fmt_epoch() { date -j -r "$1" +"$2" 2>/dev/null || date -d "@$1" +"$2"; }
+tomorrow() { date -v+1d +%Y-%m-%d 2>/dev/null || date -d tomorrow +%Y-%m-%d; }
+
+# Prints a stop flag (JSON) if the arm in $state is hit: usage from the statusline (-1 = unknown), time from the clock.
+trip_eval() {
+  jq -c --argjson a "$1" --argjson b "$2" --argjson ra "$3" --argjson rb "$4" --arg sid "$5" --argjson held "$held" '
+    def until: (if . > 0 then . else now + 18000 end) | floor;
+    select((.session // "") == "" or .session == $sid)
+    | [ if .["5h"] and $a >= .["5h"] then ["5h at \($a)% (limit \(.["5h"])%)", ($ra | until)] else empty end,
+        if .["7d"] and $b >= .["7d"] then ["7d at \($b)% (limit \(.["7d"])%)", ($rb | until)] else empty end,
+        if .at and now >= .at then ["time limit \(.at | strflocaltime("%a %d %b %H:%M")) reached", $held] else empty end ] as $h
+    | if ($h | length) > 0 then {reason: ($h | map(.[0]) | join(", ")), until: ($h | map(.[1]) | max)} + (if .session then {session: .session} else {} end) else empty end' "$state" 2>/dev/null
+}
+
+# Raises the stop flag for $state's arm and disarms it; one racing process wins the notification.
+trip() {
+  # a one-session trip never overwrites a stop flag that is already up
+  [ -f "$stop" ] && [ "$state" != "$gstate" ] && return 0
+  echo "$1" > "$stop.$$" && mv "$stop.$$" "$stop"
+  mv "$state" "$state.fired.$$" 2>/dev/null || return 0
+  rm -f "$state.fired.$$"; [ "$state" = "$gstate" ] && rm -f "$dl"; rmdir "$sdir" 2>/dev/null
+  command -v terminal-notifier >/dev/null &&
+    terminal-notifier -title claude-usage -message "$(jq -r '"\(.reason) — stopping \(if .session then "one session" else "all sessions" end)"' "$stop")" -group claude-usage >/dev/null 2>&1
+  return 0
+}
+
+# Writes a warning for sessions to pick up, and pings ~/.claude/usage-notify (a shell command taking the message as $1).
+raise_warn() {
+  local wf=$warnf
+  [ "$state" = "$gstate" ] || wf="$sdir/$4.warn.json"
+  [ "$3" = time ] && wf="${wf%.json}-time.json"
+  jq -nc --arg m "$1" --arg id "$(date +%s)-$$" --argjson u "$2" --slurpfile st "$state" \
+    '{id: $id, msg: $m, until: $u} + (if $st[0].session then {session: $st[0].session} else {} end)' > "$wf.$$" && mv "$wf.$$" "$wf"
+  [ -s "$dir/usage-notify" ] && bash -c "$(cat "$dir/usage-notify")" _ "claude-usage: $1" >/dev/null 2>&1
+  return 0
+}
 
 # Announces the highest newly crossed warning step per armed window: once per window reset and step.
-# Optional ~/.claude/usage-notify holds a shell command that receives the message as $1 (e.g. slack-ping "$1").
 warn_check() {
-  local k r s c l m5="" m7="" msg pfx="" wf="$warnf"
-  [ "$state" = "$gstate" ] || { pfx="$5@"; wf="$sdir/$5.warn.json"; }
+  local k r s c l m5="" m7="" msg pfx=""
+  [ "$state" = "$gstate" ] || pfx="$5@"
   mkdir -p "$wdir"
   while read -r k r s c l; do
     [ -n "$k" ] || continue
-    # noclobber makes the marker an atomic claim, so racing statuslines announce a step once
+    # noclobber makes the marker an atomic claim, so racing processes announce a step once
     ( set -C; : > "$wdir/$pfx$k@$r@$s" ) 2>/dev/null || continue
     case "$k" in
       5h) m5="5h usage is ${c}%, ${s}% of the way to your ${l}% limit" ;;
@@ -36,20 +106,44 @@ warn_check() {
     | select($w.c >= $t)
     | "\($w.k) \($w.r) \($s) \($w.c) \($st[$w.k])"' "$state" 2>/dev/null)
   msg="${m5}${m5:+${m7:+; }}${m7}"
-  [ -n "$msg" ] || return 0
-  jq -nc --arg m "$msg" --arg id "$(date +%s)-$$" --argjson u "$(( $(date +%s) + 1200 ))" --slurpfile st "$state" \
-    '{id: $id, msg: $m, until: $u} + (if $st[0].session then {session: $st[0].session} else {} end)' > "$wf.$$" && mv "$wf.$$" "$wf"
-  [ -s "$dir/usage-notify" ] && bash -c "$(cat "$dir/usage-notify")" _ "claude-usage: $msg" >/dev/null 2>&1
+  [ -n "$msg" ] && raise_warn "$msg" "$(( $(date +%s) + 1200 ))" usage "$5"
   return 0
+}
+
+# Time warning: at each step's share of the way from arming to the deadline, but at least 2 minutes before it.
+time_warn() {
+  local at s msg="" pfx=""
+  [ "$state" = "$gstate" ] || pfx="$1@"
+  mkdir -p "$wdir"
+  while read -r at s; do
+    [ -n "$at" ] || continue
+    ( set -C; : > "$wdir/${pfx}time@$at@$s" ) 2>/dev/null || continue
+    msg="time limit $(fmt_epoch "$at" '%a %d %b %H:%M') is $(( (at - $(date +%s) + 59) / 60 )) minutes away"
+  done < <(jq -r --arg sid "$1" '
+    select(((.session // "") == "" or .session == $sid) and .at and .armed)
+    | . as $st | ($st.warn // [95])[] as $s
+    | ([ ($st.armed + ($st.at - $st.armed) * $s / 100), ($st.at - 120) ] | min | [., $st.armed] | max) as $p
+    | select(now >= $p and now < $st.at)
+    | "\($st.at) \($s)"' "$state" 2>/dev/null)
+  [ -n "$msg" ] && raise_warn "$msg" "$(jq -r .at "$state")" time "$1"
+  return 0
+}
+
+# Evaluates one arm file: trip it, or raise any warnings that are due.
+eval_arm() {
+  [ -f "$1" ] || return 0
+  state=$1
+  local out
+  out=$(trip_eval "$2" "$3" "$4" "$5" "$6")
+  if [ -n "$out" ]; then trip "$out"; else warn_check "$2" "$3" "$4" "$5" "$6"; time_warn "$6"; fi
 }
 
 # Hands a raised warning to the calling session once, as extra context on its next tool call or prompt.
 hook_warn() {
-  local until fsess id msg ev sid scope f
-  IFS='|' read -r ev sid < <(jq -r '[.hook_event_name // "", .session_id // ""] | join("|")' 2>/dev/null)
+  local ev=$1 sid=$2 until fsess id msg scope f
   case "$ev" in PreToolUse|UserPromptSubmit) ;; *) return 0 ;; esac
   [ -n "$sid" ] || return 0
-  for f in "$warnf" "$sdir/$sid.warn.json"; do
+  for f in "$warnf" "${warnf%.json}-time.json" "$sdir/$sid.warn.json" "$sdir/$sid.warn-time.json"; do
     [ -f "$f" ] || continue
     read -r until fsess id msg < <(jq -r '"\(.until) \(.session // "-") \(.id) \(.msg)"' "$f" 2>/dev/null)
     [ "${until:-0}" -gt "$(date +%s)" ] 2>/dev/null || { rm -f "$f"; continue; }
@@ -64,32 +158,54 @@ hook_warn() {
 }
 
 case "$1" in
-  5h|7d|--session|--warn)
-    # --session <id> scopes the switch to one session (for testing): its own statusline trips it, only it halts
-    # --warn 50,80 sets the warning steps, as percents of the limit (default 95); none turns warnings off
+  5h|7d|at|--session|--warn)
     sess=""; warn=""
     while [ "${1-}" = --session ] || [ "${1-}" = --warn ]; do
-      [ $# -ge 2 ] || { echo "usage: claude-usage [--session <id>] [--warn 95|none] 5h|7d <percent> [...]" >&2; exit 2; }
+      [ $# -ge 2 ] || die "$1 needs a value (see claude-usage help)"
       case "$1" in
-        --session) sess=$2; [[ "$sess" =~ ^[A-Za-z0-9-]+$ ]] || { echo "bad session id '$2'" >&2; exit 2; } ;;
-        --warn) warn=$2; [ "$warn" = none ] || [[ "$warn" =~ ^[1-9][0-9]?(,[1-9][0-9]?)*$ ]] || { echo "bad --warn '$2' (whole percents of the limit, 1-99, e.g. 50,80; or none)" >&2; exit 2; } ;;
+        --session) sess=$2; [[ "$sess" =~ ^[A-Za-z0-9-]+$ ]] || die "bad session id '$2'" ;;
+        --warn) warn=$2; [ "$warn" = none ] || [[ "$warn" =~ ^[1-9][0-9]?(,[1-9][0-9]?)*$ ]] || die "bad --warn '$2' (whole percents of the limit, 1-99, e.g. 50,80; or none)" ;;
       esac
       shift 2
     done
-    [ $# -ge 2 ] || { echo "usage: claude-usage [--session <id>] [--warn 95|none] 5h|7d <percent> [...]" >&2; exit 2; }
-    # validate every pair before arming anything, so a typo in the second pair never half-arms
-    new='{}'; msg=""
+    [ $# -ge 2 ] || { usage >&2; exit 2; }
+    # validate every limit before arming anything, so a typo in a later one never half-arms
+    new='{}'; msg=""; at=""; nowts=$(date +%s)
     while [ $# -gt 0 ]; do
-      w=$1; pct=${2%\%}
-      case "$w" in 5h|7d) ;; *) echo "unknown window '$w' (use 5h or 7d)" >&2; exit 2 ;; esac
-      [[ "$pct" =~ ^[0-9]+$ ]] && [ "$pct" -ge 1 ] && [ "$pct" -le 100 ] || { echo "bad percent '${2-}' for $w (whole number, 1-100)" >&2; exit 2; }
-      key=five_hour; [ "$w" = 7d ] && key=seven_day
-      now=$(jq -r ".rate_limits.$key.used_percentage // 0 | round" "$last" 2>/dev/null)
-      now=${now:-0}
-      [ "$now" -ge "$pct" ] && { echo "$w is already at ~${now}% (>= ${pct}%) — it would fire immediately" >&2; exit 1; }
-      new=$(jq -c --arg w "$w" --argjson p "$pct" '.[$w]=$p' <<<"$new")
-      msg+="$w >= ${pct}% (now ${now}%); "
-      shift 2
+      case "$1" in
+        at)
+          [ -z "$at" ] || die "only one time limit per arm"
+          hhmm='^([01]?[0-9]|2[0-3]):([0-5][0-9])$'
+          if [[ "${2-}" =~ $hhmm ]]; then
+            t=$(printf '%02d:%s' "$((10#${BASH_REMATCH[1]}))" "${BASH_REMATCH[2]}")
+            at=$(to_epoch "$(date +%Y-%m-%d) $t")
+            [ -n "$at" ] && [ "$at" -le "$nowts" ] && at=$(to_epoch "$(tomorrow) $t")
+            shift 2
+          elif [[ "${3-}" =~ $hhmm ]] && { [[ "${2-}" =~ ^[0-9]{2}-[0-9]{2}-[0-9]{4}$ ]] || [[ "${2-}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; }; then
+            t=$(printf '%02d:%s' "$((10#${3%%:*}))" "${3#*:}")
+            d=$2; [[ "$d" =~ ^([0-9]{2})-([0-9]{2})-([0-9]{4})$ ]] && d="${BASH_REMATCH[3]}-${BASH_REMATCH[2]}-${BASH_REMATCH[1]}"
+            at=$(to_epoch "$d $t")
+            [ -n "$at" ] || die "'$2 $3' is not a real date and time"
+            [ "$at" -gt "$nowts" ] || die "'$2 $3' is in the past"
+            shift 3
+          else
+            die "bad time '${2-} ${3-}'; use HH:MM, DD-MM-YYYY HH:MM or YYYY-MM-DD HH:MM (24-hour)"
+          fi
+          [ -n "$at" ] || die "could not read the time '${2-}'"
+          new=$(jq -c --argjson t "$at" --argjson n "$nowts" '.at=$t | .armed=$n' <<<"$new")
+          msg+="time $(fmt_epoch "$at" '%a %d %b %H:%M') (in $(( (at - nowts) / 3600 ))h $(( (at - nowts) % 3600 / 60 ))m); " ;;
+        5h|7d)
+          w=$1; pct=${2-}; pct=${pct%\%}
+          [[ "$pct" =~ ^[0-9]+$ ]] && [ "$pct" -ge 1 ] && [ "$pct" -le 100 ] || die "bad percent '${2-}' for $w (whole number, 1-100)"
+          key=five_hour; [ "$w" = 7d ] && key=seven_day
+          now=$(jq -r ".rate_limits.$key.used_percentage // 0 | round" "$last" 2>/dev/null)
+          now=${now:-0}
+          [ "$now" -ge "$pct" ] && { echo "claude-usage: $w is already at ~${now}% (>= ${pct}%) — it would fire immediately" >&2; exit 1; }
+          new=$(jq -c --arg w "$w" --argjson p "$pct" '.[$w]=$p' <<<"$new")
+          msg+="$w >= ${pct}% (now ${now}%); "
+          shift 2 ;;
+        *) die "unknown limit '$1' (see claude-usage help)" ;;
+      esac
     done
     if [ -n "$warn" ]; then
       if [ "$warn" = none ]; then wj='[]'; else wj=$(jq -cn --arg w "$warn" '$w | split(",") | map(tonumber) | unique'); fi
@@ -99,26 +215,31 @@ case "$1" in
       # a scoped arm only ever touches its own session's files, never the global arm, warning or stop flag
       mkdir -p "$sdir"; target="$sdir/$sess.json"; base='{}'
       new=$(jq -c --arg s "$sess" '.session=$s' <<<"$new")
-      rm -f "$sdir/$sess.warn.json" "$wdir/$sess@"*
+      rm -f "$sdir/$sess.warn.json" "$sdir/$sess.warn-time.json" "$wdir/$sess@"*
       [ "$(jq -r '.session // empty' "$stop" 2>/dev/null)" = "$sess" ] && rm -f "$stop"
     else
-      target="$state"; rm -rf "$stop" "$warnf" "$wdir"
+      target="$state"; rm -rf "$stop" "$warnf" "${warnf%.json}-time.json" "$wdir"
       base=$(jq -c 'del(.session)' "$state" 2>/dev/null || echo '{}')
     fi
     jq -cn --argjson a "$base" --argjson b "$new" '$a + $b' > "$target.tmp.$$" && mv "$target.tmp.$$" "$target"
-    echo "armed ${sess:+for session $sess: }${msg%; }. $(jq -c . "$target")" ;;
-  off) rm -rf "$state" "$stop" "$warnf" "$wdir" "$sdir" && echo "disarmed, stop flag cleared" ;;
+    [ -z "$sess" ] && { if jq -e .at "$target" >/dev/null 2>&1; then : > "$dl"; else rm -f "$dl"; fi; }
+    echo "armed ${sess:+for session $sess: }${msg%; }; whichever comes first stops $([ -n "$sess" ] && echo "that session" || echo "every session")" ;;
+  off) rm -rf "$state" "$stop" "$warnf" "${warnf%.json}-time.json" "$wdir" "$sdir" "$dl" && echo "disarmed, stop flag cleared" ;;
   status|"")
     armed=""
-    [ -f "$state" ] && { echo "armed: $(jq -c . "$state" 2>/dev/null || echo "state file is unreadable, run: claude-usage off")"; armed=1; }
-    for f in "$sdir"/*.json; do
+    for f in "$state" "$sdir"/*.json; do
       [ -f "$f" ] || continue
-      case "$f" in *.warn.json) continue ;; esac
-      echo "armed (one session): $(jq -c . "$f" 2>/dev/null || echo "unreadable, run: claude-usage off")"; armed=1
+      case "$f" in *.warn.json|*.warn-time.json) continue ;; esac
+      echo "armed$([ "$f" = "$state" ] || echo " (one session)"): $(jq -r '
+        ([ (if .["5h"] then "5h >= \(.["5h"])%" else empty end), (if .["7d"] then "7d >= \(.["7d"])%" else empty end),
+           (if .at then "time \(.at | strflocaltime("%a %d %b %H:%M"))" else empty end) ] | join(", "))
+        + (if .session then " [session \(.session)]" else "" end) + (if .warn then " [warn \(.warn | map(tostring) | join(","))]" else "" end)' "$f" 2>/dev/null || echo "unreadable, run: claude-usage off")"
+      armed=1
     done
     [ -n "$armed" ] || echo "not armed"
-    [ -f "$stop" ] && echo "stop flag raised: $(jq -r '"\(.reason), until \(.until | strflocaltime("%a %H:%M"))"' "$stop")"
+    [ -f "$stop" ] && echo "stop flag raised: $(jq -r --argjson held "$held" '"\(.reason), \(if .until >= $held then "until claude-usage off" else "until \(.until | strflocaltime("%a %H:%M"))" end)"' "$stop")"
     exit 0 ;;
+  help|-h|--help) usage ;;
   statusline)
     input=$(cat)
     printf '%s' "$input" > "$last.$$" && mv "$last.$$" "$last"
@@ -131,38 +252,23 @@ case "$1" in
     case "$wrapped" in ""|*"claude-usage statusline"*) ;; *) printf '%s' "$input" | bash -c "$wrapped" ;; esac ;;
   check)
     # the global arm is evaluated on every render; a --session arm only on that session's own renders
-    for f in "$gstate" "$sdir/${6:--}.json"; do
-      [ -f "$f" ] || continue
-      state=$f
-      out=$(jq -c --argjson a "${2:-0}" --argjson b "${3:-0}" --argjson ra "${4:-0}" --argjson rb "${5:-0}" --arg sid "${6:--}" '
-        def until: (if . > 0 then . else now + 18000 end) | floor;
-        select((.session // "") == "" or .session == $sid)
-        | [ if .["5h"] and $a >= .["5h"] then ["5h at \($a)% (limit \(.["5h"])%)", ($ra | until)] else empty end,
-            if .["7d"] and $b >= .["7d"] then ["7d at \($b)% (limit \(.["7d"])%)", ($rb | until)] else empty end ] as $h
-        | if ($h | length) > 0 then {reason: ($h | map(.[0]) | join(", ")), until: ($h | map(.[1]) | max)} + (if .session then {session: .session} else {} end) else empty end' "$state")
-      [ -n "$out" ] || { warn_check "${2:-0}" "${3:-0}" "${4:-0}" "${5:-0}" "${6:--}"; continue; }
-      # a one-session trip never overwrites a stop flag that is already up
-      [ -f "$stop" ] && [ "$state" != "$gstate" ] && continue
-      # flag first (atomic, idempotent for racers), then the mv claim picks one process to notify
-      echo "$out" > "$stop.$$" && mv "$stop.$$" "$stop"
-      mv "$state" "$state.fired.$$" 2>/dev/null || continue
-      rm -f "$state.fired.$$"; rmdir "$sdir" 2>/dev/null
-      command -v terminal-notifier >/dev/null &&
-        terminal-notifier -title claude-usage -message "$(jq -r '"\(.reason) — stopping \(if .session then "one session" else "all sessions" end)"' "$stop")" -group claude-usage >/dev/null 2>&1
-    done
+    for f in "$gstate" "$sdir/${6:--}.json"; do eval_arm "$f" "${2:-0}" "${3:-0}" "${4:-0}" "${5:-0}" "${6:--}"; done
     exit 0 ;;
   hook)
-    [ -f "$stop" ] || { hook_warn; exit 0; }
+    IFS='|' read -r ev sid < <(jq -r '[.hook_event_name // "", .session_id // ""] | join("|")' 2>/dev/null)
+    # the clock needs no statusline render: any session's next tool call or prompt checks a time limit
+    [ -f "$dl" ] && eval_arm "$gstate" -1 -1 0 0 "${sid:--}"
+    [ -n "$sid" ] && jq -e .at "$sdir/$sid.json" >/dev/null 2>&1 && eval_arm "$sdir/$sid.json" -1 -1 0 0 "$sid"
+    [ -f "$stop" ] || { hook_warn "$ev" "$sid"; exit 0; }
     read -r until fsess reason < <(jq -r '"\(.until) \(.session // "-") \(.reason)"' "$stop" 2>/dev/null)
     until=${until%.*}
     # only a readable, expired flag lifts the block; an unreadable one keeps halting until `off`
-    [[ "$until" =~ ^[0-9]+$ ]] && [ "$until" -le "$(date +%s)" ] && { rm -f "$stop"; exit 0; }
+    [[ "$until" =~ ^[0-9]+$ ]] && [ "$until" -le "$(date +%s)" ] && { rm -f "$stop"; hook_warn "$ev" "$sid"; exit 0; }
     reason=${reason:-unreadable stop flag}
-    IFS='|' read -r ev sid < <(jq -r '[.hook_event_name // "", .session_id // ""] | join("|")' 2>/dev/null)
     # a flag armed with --session halts that session only
-    [ -n "$fsess" ] && [ "$fsess" != - ] && [ "$fsess" != "$sid" ] && exit 0
+    [ -n "$fsess" ] && [ "$fsess" != - ] && [ "$fsess" != "$sid" ] && { hook_warn "$ev" "$sid"; exit 0; }
     # continue:false alone stops the session only after the tool ran; PreToolUse needs an explicit deny to block it
-    jq -nc --arg m "Usage limit hit: $reason. Run claude-usage off to resume." --arg e "$ev" \
+    jq -nc --arg m "claude-usage limit hit: $reason. Run claude-usage off to resume." --arg e "$ev" \
       '{continue: false, stopReason: $m} + (if $e == "PreToolUse" then {hookSpecificOutput: {hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: $m}} else {} end)' ;;
-  *) echo "usage: claude-usage [--session <id>] [--warn 95|none] 5h|7d <percent> [5h|7d <percent>] | status | off" >&2; exit 2 ;;
+  *) usage >&2; exit 2 ;;
 esac
