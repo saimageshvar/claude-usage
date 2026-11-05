@@ -17,27 +17,53 @@ held=4102444800            # stop-flag `until` for a time trip: it holds until `
 
 usage() {
   cat <<'EOF'
-usage: claude-usage [--session <id>] [--warn 95|50,80|none] <limit>... | status | off | help
+claude-usage: kill switch for Claude Code. Halts sessions when a usage limit or a clock time is reached.
 
-Limits (any mix; whichever is hit first stops every session):
-  5h 30%                  5-hour usage reaches 30%
-  7d 40%                  weekly usage reaches 40%
-  at 07:00                the next 07:00 (today if still ahead, else tomorrow)
-  at 7pm                  12-hour works too: 7pm, 7:30pm, 7:30 pm, 12am (midnight), 12pm (noon)
-  at 25-12-2026 07:00     a date and time, DD-MM-YYYY then the time (24- or 12-hour)
-  at 2026-12-25 7:30pm    a date and time, YYYY-MM-DD then the time
-  A time without am/pm is 24-hour: 7:00 is 07:00 in the morning, never 19:00.
+USAGE
+  claude-usage [--session <id>] [--warn <steps>] <limit> [<limit>...]   arm
+  claude-usage status                                                  show what is armed and any raised stop (also: no arguments)
+  claude-usage off                                                     disarm everything and lift any stop
+  claude-usage help                                                    this text
 
-Examples:
-  claude-usage 5h 30%
-  claude-usage at 07:00
-  claude-usage 5h 30% 7d 40% at 07:00
+LIMITS (combine any; OR mode: the first one reached trips the switch)
+  5h <N>%       5-hour usage reaches N% (N = 1-100; the % sign is optional)
+  7d <N>%       7-day (weekly) usage reaches N%
+  at <time>             next occurrence of <time>: today if still ahead, else tomorrow
+  at <date> <time>      that exact date and time
+  Order does not matter. At most one `at` per command; a repeated 5h or 7d keeps the last value.
 
-Options:
-  --warn 95       warn sessions at 95% of the way to each limit (default); 50,80 for several steps; none for off
-  --session <id>  arm for one session only (testing); never touches the global arm
+  <time>  24-hour HH:MM            07:00  19:30  7:05
+          12-hour with am/pm       7pm  7:30pm  7:30 pm  07:05AM  12am (midnight)  12pm (noon)
+          No am/pm means 24-hour: 7:00 is 07:00 in the morning, never 19:00.
+  <date>  DD-MM-YYYY or YYYY-MM-DD   25-12-2026  2026-12-25
+  All times are local. Anything else is rejected, as is a date and time already past.
 
-A usage stop lifts when its window resets; a time stop holds until `claude-usage off`.
+OPTIONS (before the limits)
+  --warn <steps>   warn each session at these percents of the way to each limit (default 95);
+                   comma-separated whole numbers 1-99 (e.g. 50,80), or none
+  --session <id>   arm for one session only, for testing; never touches the global arm
+
+EXAMPLES
+  claude-usage 5h 30%                    stop all sessions at 30% of the 5-hour limit
+  claude-usage at 7am                    stop all sessions at the next 7 am
+  claude-usage 5h 30% 7d 40% at 23:30    whichever comes first
+  claude-usage at 25-12-2026 7:30pm      a specific date and time
+  claude-usage --warn none 7d 50%        no warning before the stop
+
+BEHAVIOUR
+  Arming is one-shot: a trip disarms the switch and raises a stop.
+  While a stop is raised, every session's next tool call is denied and new prompts are refused.
+  A usage stop lifts when its usage window resets; a time stop holds until `claude-usage off`.
+  Before a limit, each session gets one warning (as context on its next tool call or prompt)
+  telling it to wrap up.
+  Re-arming replaces only the limits you name; others already armed stay (a --session arm is
+  replaced whole).
+  The arm message prints the resolved time (e.g. "time Fri 06 Nov 07:00 (in 6h 36m)"): check it.
+
+EXIT CODES
+  0  success
+  1  a usage limit is already reached (arming would fire immediately); nothing changed
+  2  invalid arguments; nothing changed
 EOF
 }
 
@@ -249,7 +275,7 @@ case "$1" in
       echo "armed$([ "$f" = "$state" ] || echo " (one session)"): $(jq -r '
         ([ (if .["5h"] then "5h >= \(.["5h"])%" else empty end), (if .["7d"] then "7d >= \(.["7d"])%" else empty end),
            (if .at then "time \(.at | strflocaltime("%a %d %b %H:%M"))" else empty end) ] | join(", "))
-        + (if .session then " [session \(.session)]" else "" end) + (if .warn then " [warn \(.warn | map(tostring) | join(","))]" else "" end)' "$f" 2>/dev/null || echo "unreadable, run: claude-usage off")"
+        + (if .session then " [session \(.session)]" else "" end) + (if .warn then " [warn \(if .warn == [] then "none" else (.warn | map(tostring) | join(",")) end)]" else "" end)' "$f" 2>/dev/null || echo "unreadable, run: claude-usage off")"
       armed=1
     done
     [ -n "$armed" ] || echo "not armed"
